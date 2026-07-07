@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +16,34 @@ app.add_middleware(
     allow_methods = ["*"],
     allow_headers = ["*"]
 )
+
+
+def _extract_text(payload):
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, list):
+        return "".join(_extract_text(item) for item in payload)
+    if isinstance(payload, dict):
+        for key in ("text", "output_text", "content", "message", "delta"):
+            if key in payload:
+                text = _extract_text(payload[key])
+                if text:
+                    return text
+    return ""
+
+
+def _parse_json_object(text):
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned.strip(), flags=re.IGNORECASE)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(cleaned[start:end + 1])
+        raise
 
 
 @app.post("/solve")
@@ -51,8 +80,8 @@ async def solve(request: Request):
             )
             response.raise_for_status()
             data = response.json()
-            data = data["output"][0]["content"][0]["text"]
-            out = json.loads(data)
+            text = _extract_text(data.get("output", data)) or _extract_text(data)
+            out = _parse_json_object(text)
             ans = int(round(float(out.get("answer"))))
             reasoning = str(out.get("reasoning", ""))
             if len(reasoning) < 80:
