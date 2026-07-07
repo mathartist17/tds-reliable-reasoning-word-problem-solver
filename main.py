@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 import httpx
@@ -17,34 +18,49 @@ app.add_middleware(
     allow_headers = ["*"]
 )
 
+_CACHE = {}
+token = os.getenv("AIPIPE_TOKEN")
+AIPIPE_BASE = "https://aipipe.org/openai/v1"
 
-def _extract_text(payload):
-    if isinstance(payload, str):
-        return payload
-    if isinstance(payload, list):
-        return "".join(_extract_text(item) for item in payload)
-    if isinstance(payload, dict):
-        for key in ("text", "output_text", "content", "message", "delta"):
-            if key in payload:
-                text = _extract_text(payload[key])
-                if text:
-                    return text
-    return ""
+HEAD = {"Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"}
 
+def _ck(*parts):
+    return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
+import asyncio
 
-def _parse_json_object(text):
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned.strip(), flags=re.IGNORECASE)
+async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4):
+    key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
+    if key in _CACHE:
+        return _CACHE[key]
+    body = {"model": model, "messages": messages,
+            "temperature": 0, "max_tokens": max_tokens}
+    if force_json:
+        body["response_format"] = {"type": "json_object"}
+    last_err = None
+    async with httpx.AsyncClient(timeout=90) as c:
+        for attempt in range(retries):
+            r = await c.post(f"{AIPIPE_BASE}/chat/completions",
+                             headers=HEAD, json=body)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code}: {r.text[:160]}"
+                await asyncio.sleep(1.5 * (attempt + 1))   # backoff and retry
+                continue
+            r.raise_for_status()
+            out = r.json()["choices"][0]["message"]["content"]
+            _CACHE[key] = out
+            return out
+    raise RuntimeError(f"chat failed after {retries} retries: {last_err}")
+
+def parse_json(s):
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-z]*\n?|\n?```$", "", s).strip()
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(cleaned[start:end + 1])
-        raise
-
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"\{.*\}", s, re.DOTALL)
+        return json.loads(m.group(0)) if m else {}
 
 @app.post("/solve")
 async def solve(request: Request):
@@ -62,32 +78,15 @@ async def solve(request: Request):
         "float, no symbols).\n\n"
         f"PROBLEM:\n{problem}"
     )
-    payload = {
-        "model": AIPIPE_MODEL,
-        "input": prompt,
-        "temperature": 0
-    }
     try:
-        # Q9 is graded on exact integer correctness -> use the strongest model.
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://aipipe.org/openrouter/v1/responses",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=payload
-            )
-            response.raise_for_status()
-            data = response.json()
-            text = _extract_text(data.get("output", data)) or _extract_text(data)
-            out = _parse_json_object(text)
-            ans = int(round(float(out.get("answer"))))
-            reasoning = str(out.get("reasoning", ""))
-            if len(reasoning) < 80:
-                reasoning = (reasoning + " Step-by-step arithmetic reasoning applied; "
-                            "irrelevant distractor values were identified and ignored.").strip()
-            return {"reasoning": reasoning, "answer": ans}
+        out = parse_json(await chat([{"role": "user", "content": prompt}],
+                                    model="gpt-4o", max_tokens=1200))
+        ans = int(round(float(out.get("answer"))))
+        reasoning = str(out.get("reasoning", ""))
+        if len(reasoning) < 80:
+            reasoning = (reasoning + " Step-by-step arithmetic reasoning applied; "
+                         "irrelevant distractor values were identified and ignored.").strip()
+        return {"reasoning": reasoning, "answer": ans}
     except Exception as e:
         return {"reasoning": "Could not solve reliably: " + str(e)[:120].ljust(80),
                 "answer": 0}
